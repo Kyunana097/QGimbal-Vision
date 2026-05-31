@@ -364,7 +364,7 @@ def process_frame(frame: np.ndarray, p: dict):
 
 def capture_loop(camera_idx: int, flip_frame: bool = True):
     """后台线程：持续采集摄像头、处理帧、运行 PID 控制"""
-    global main_jpeg, debug_jpeg
+    global main_jpeg, debug_jpeg, latest_data
 
     cap = cv2.VideoCapture(camera_idx)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
