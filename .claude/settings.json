@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la \"C:/Users/62705/Desktop/【开源】全新重制二维云台/QGimbal-Vision/\")",
+      "Read(//c/Users/62705/Desktop/【开源】全新重制二维云台/QGimbal-Vision/**)"
+    ]
+  }
+}
