@@ -4,7 +4,7 @@
 用法 (在香橙派5 Max上):
   python3 tools/circle_test.py
   python3 tools/circle_test.py --radius 5 --freq 0.3 --duration 20
-  python3 tools/circle_test.py --port /dev/ttyS2 --baud 1152000
+  python3 tools/circle_test.py --port /dev/ttyS2 --baud 115200
 
 原理:
   向 yaw/pitch 轴发送正交的正弦波速度指令（相位差 90°），
@@ -171,8 +171,8 @@ def main() -> None:
         help="串口设备 (Orange Pi 5 Max UART2 默认: /dev/ttyS2)",
     )
     parser.add_argument(
-        "--baud", type=int, default=1_152_000,
-        help="波特率 (STM32 默认: 1152000)",
+        "--baud", type=int, default=115200,
+        help="波特率 (STM32 默认: 115200)",
     )
     parser.add_argument(
         "--radius", type=float, default=3.0,

@@ -168,7 +168,7 @@ def main() -> None:
        GND  ───────────────────── → GND
 
 注意:
-  1. 波特率必须是 1152000 (与 STM32 usart.c 一致)
+  1. 波特率必须是 115200 (与 STM32 usart.c 一致)
   2. 如果连接失败，检查是否已启用 UART2:
      sudo orangepi-config → System → Hardware → 启用 UART2
 """,
@@ -178,8 +178,8 @@ def main() -> None:
         help="串口设备 (Orange Pi 5 Max UART2 默认: /dev/ttyS2)",
     )
     parser.add_argument(
-        "--baud", type=int, default=1_152_000,
-        help="波特率 (STM32 默认: 1152000)",
+        "--baud", type=int, default=115200,
+        help="波特率 (STM32 默认: 115200)",
     )
     parser.add_argument(
         "action", nargs="?", default="monitor",

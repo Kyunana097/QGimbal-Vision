@@ -28,7 +28,7 @@ class GimbalSerialStub:
     """
 
     port: Optional[str] = "/dev/ttyS2"   # Orange Pi 5 Max UART2
-    baudrate: int = 1_152_000           # 匹配 STM32 USART6 波特率
+    baudrate: int = 115200           # 匹配 STM32 USART6 波特率
 
     # Enable fields: 0 disable, 1 enable, other no action
     laser_enabled: int = 2

@@ -678,7 +678,7 @@ def reconnect_serial():
     global gimbal_serial
     data = request.get_json() or {}
     port = data.get('port', None)
-    baud = int(data.get('baud', 1152000))
+    baud = int(data.get('baud', 115200))
 
     with tracker_lock:
         if gimbal_serial is not None:
@@ -1326,7 +1326,7 @@ HTML_PAGE = r'''
         <label>端口:</label>
         <input type="text" id="serial_port" placeholder="COM3 或留空" value="">
         <label>波特率:</label>
-        <input type="number" id="serial_baud" value="1152000" style="width:100px;">
+        <input type="number" id="serial_baud" value="115200" style="width:100px;">
         <button class="btn btn-serial" onclick="reconnectSerial()">重连串口</button>
     </div>
 
@@ -1376,7 +1376,7 @@ function applyPID() {
 
 function reconnectSerial() {
     const port = document.getElementById('serial_port').value || null;
-    const baud = parseInt(document.getElementById('serial_baud').value) || 1152000;
+    const baud = parseInt(document.getElementById('serial_baud').value) || 115200;
     fetch('/reconnect_serial', {
         method:'POST',
         headers:{'Content-Type':'application/json'},
@@ -1572,7 +1572,7 @@ def parse_args():
     p.add_argument('--port', type=int, default=5000, help='Flask 端口（默认 5000）')
     p.add_argument('--no-flip', action='store_true', help='不翻转画面')
     p.add_argument('--serial-port', type=str, default="/dev/ttyS2", help='串口端口号（默认 Orange Pi 5 Max UART2: /dev/ttyS2）')
-    p.add_argument('--serial-baud', type=int, default=1152000, help='串口波特率（默认 1152000）')
+    p.add_argument('--serial-baud', type=int, default=115200, help='串口波特率（默认 115200）')
     return p.parse_args()
 
 

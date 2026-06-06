@@ -80,7 +80,7 @@ class GimbalSerial:
     def __init__(
         self,
         port: str = "/dev/ttyS2",      # Orange Pi 5 Max UART2
-        baudrate: int = 1_152_000,     # STM32 USART6 实际波特率
+        baudrate: int = 115200,        # STM32 USART6 波特率
         timeout: float = 0.05,
     ):
         import serial
