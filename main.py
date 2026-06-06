@@ -15,6 +15,7 @@ QGimbal-Vision — 二维云台视觉追踪 + Flask 实时调参
 from __future__ import annotations
 
 import argparse
+import math
 import signal
 import sys
 import threading
@@ -25,7 +26,7 @@ from flask import Flask, Response, jsonify, request
 
 # ── 开源项目模块 ──────────────────────────────────────────────────
 from control.config import ControlConfig, PIDConfig
-from control.serial_stub import GimbalSerialStub
+from control.gimbal_serial import GimbalSerial, CommandPacket, TelemetryPacket
 from control.tracker_control import GimbalTracker
 
 # ══════════════════════════════════════════════════════════════════
@@ -103,8 +104,25 @@ A4_RATIO = np.sqrt(2)
 
 # PID/串口 组件（在 main 中初始化）
 tracker: GimbalTracker | None = None
-serial_stub: GimbalSerialStub | None = None
+gimbal_serial: GimbalSerial | None = None
 tracker_lock = threading.Lock()
+
+# 控制模式
+control_mode: str = 'track'        # 'track' | 'manual' | 'test' | 'idle'
+control_mode_lock = threading.Lock()
+
+# 手动控制当前速度
+manual_yaw_rpm: float = 0.0
+manual_pitch_rpm: float = 0.0
+MANUAL_SPEED = 5.0                 # 慢速移动 RPM
+
+# 测试信号线程
+test_thread: threading.Thread | None = None
+test_stop = threading.Event()
+
+# 串口遥测
+latest_telemetry: dict = {}
+telemetry_lock = threading.Lock()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -408,19 +426,37 @@ def capture_loop(camera_idx: int, flip_frame: bool = True):
             cv2.putText(processed, f"FPS: {fps:.1f}", (10, processed.shape[0] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-            # ── PID 追踪控制（使用开源模块） ──
+            # ── PID 追踪控制 + 模式化串口发送 ──
             ctrl_out = None
-            with tracker_lock:
-                if tracker is not None and p['control_enabled']:
-                    ret, ctrl_out = tracker.update(
-                        frame_w=frame.shape[1],
-                        frame_h=frame.shape[0],
-                        target_center=target_center,
-                        dt=max(dt, 1e-6),
-                        now=now,
-                    )
-                    if ret and serial_stub is not None:
-                        serial_stub.send_rpm(ctrl_out.yaw_rpm, ctrl_out.pitch_rpm)
+            with control_mode_lock:
+                mode = control_mode
+
+            if tracker is not None and mode == 'track':
+                ret, ctrl_out = tracker.update(
+                    frame_w=frame.shape[1],
+                    frame_h=frame.shape[0],
+                    target_center=target_center,
+                    dt=max(dt, 1e-6),
+                    now=now,
+                )
+                if ret and gimbal_serial:
+                    with tracker_lock:
+                        gimbal_serial.send(CommandPacket(
+                            yaw_speed=float(ctrl_out.yaw_rpm),
+                            pitch_speed=float(ctrl_out.pitch_rpm),
+                            enabled=1, stability_enabled=1,
+                        ))
+
+            elif mode == 'manual':
+                with tracker_lock:
+                    if gimbal_serial:
+                        gimbal_serial.send(CommandPacket(
+                            yaw_speed=float(manual_yaw_rpm),
+                            pitch_speed=float(manual_pitch_rpm),
+                            enabled=1, stability_enabled=1,
+                        ))
+            # 'test': 测试线程独立发送
+            # 'idle': 不发送任何指令
 
             # ── 控制信息叠加到主画面 ──
             if ctrl_out is not None:
@@ -490,6 +526,76 @@ def generate_debug_frames():
 
 
 # ══════════════════════════════════════════════════════════════════
+# 后台串口线程
+# ══════════════════════════════════════════════════════════════════
+
+def _telemetry_reader():
+    """后台线程：持续读取 STM32 遥测数据"""
+    while not stop_event.is_set():
+        with tracker_lock:
+            if gimbal_serial:
+                pkg = gimbal_serial.recv()
+                if pkg:
+                    with telemetry_lock:
+                        latest_telemetry.update({
+                            'connected': True,
+                            'imu_yaw': round(pkg.imu_yaw, 4),
+                            'imu_pitch': round(pkg.imu_pitch, 4),
+                            'imu_roll': round(pkg.imu_roll, 4),
+                            'yaw_imu_angle': round(pkg.yaw_imu_angle, 4),
+                            'pitch_imu_angle': round(pkg.pitch_imu_angle, 4),
+                            'yaw_motor_angle': round(pkg.yaw_motor_angle, 4),
+                            'pitch_motor_angle': round(pkg.pitch_motor_angle, 4),
+                            'enabled': pkg.enabled,
+                            'stability': pkg.stability_enabled,
+                            'laser': pkg.laser_enabled,
+                        })
+        time.sleep(0.01)
+
+
+def _test_signal_runner(signal_type: str):
+    """后台线程：生成测试信号波形（画圆 / 点头）"""
+    global control_mode
+    with control_mode_lock:
+        control_mode = 'test'
+
+    omega = 2.0 * math.pi * 0.5     # 0.5 Hz
+    amplitude = 3.0                  # 速度幅值 RPM
+    t0 = time.time()
+
+    try:
+        while not test_stop.is_set():
+            t = time.time() - t0
+            if signal_type == 'circle':
+                yaw_rpm = amplitude * math.cos(omega * t)
+                pitch_rpm = amplitude * math.sin(omega * t)
+            elif signal_type == 'nod':
+                yaw_rpm = 0.0
+                pitch_rpm = amplitude * math.sin(omega * t)
+            else:
+                break
+
+            with tracker_lock:
+                if gimbal_serial:
+                    gimbal_serial.send(CommandPacket(
+                        yaw_speed=float(yaw_rpm),
+                        pitch_speed=float(pitch_rpm),
+                        enabled=1, stability_enabled=1,
+                    ))
+            time.sleep(0.02)
+    finally:
+        # 停止后发送零速指令
+        with tracker_lock:
+            if gimbal_serial:
+                gimbal_serial.send(CommandPacket(
+                    yaw_speed=0.0, pitch_speed=0.0,
+                    enabled=1, stability_enabled=1,
+                ))
+        with control_mode_lock:
+            control_mode = 'idle'
+
+
+# ══════════════════════════════════════════════════════════════════
 # Flask 路由
 # ══════════════════════════════════════════════════════════════════
 
@@ -521,6 +627,7 @@ def data():
 
 @app.route('/set_param', methods=['POST'])
 def set_param():
+    global control_mode
     data = request.get_json()
     name = data['name']
     value = data['value']
@@ -532,6 +639,14 @@ def set_param():
             else:
                 value = float(value)
             params[name] = value
+
+            # 同步 control_enabled 滑块 ↔ control_mode
+            if name == 'control_enabled':
+                with control_mode_lock:
+                    if value == 1 and control_mode != 'test':
+                        control_mode = 'track'
+                    elif value == 0:
+                        control_mode = 'idle'
 
     return jsonify({'status': 'ok'})
 
@@ -560,17 +675,157 @@ def reset_params():
 @app.route('/reconnect_serial', methods=['POST'])
 def reconnect_serial():
     """重新连接串口"""
-    global serial_stub
+    global gimbal_serial
     data = request.get_json() or {}
     port = data.get('port', None)
     baud = int(data.get('baud', 1152000))
 
     with tracker_lock:
-        if serial_stub is not None:
-            serial_stub.close()
-        serial_stub = GimbalSerialStub(port=port if port else None, baudrate=baud)
-        serial_stub.open()
+        if gimbal_serial is not None:
+            gimbal_serial.close()
+        if port:
+            try:
+                gimbal_serial = GimbalSerial(port=port, baudrate=baud)
+            except Exception as e:
+                gimbal_serial = None
+                return jsonify({'status': 'error', 'message': str(e)})
+        else:
+            gimbal_serial = None
     return jsonify({'status': 'ok', 'port': port, 'baud': baud})
+
+
+@app.route('/manual_control', methods=['POST'])
+def manual_control():
+    """手动方向控制"""
+    global control_mode, manual_yaw_rpm, manual_pitch_rpm
+    data = request.get_json()
+    direction = data.get('direction', 'stop')
+
+    # 保持锁顺序: params_lock → control_mode_lock（与 set_param 一致，避免死锁）
+    if direction != 'stop':
+        with params_lock:
+            params['control_enabled'] = 0  # 手动模式下关闭 PID
+
+    with control_mode_lock:
+        if direction == 'stop':
+            manual_yaw_rpm = 0.0
+            manual_pitch_rpm = 0.0
+        elif control_mode != 'test':
+            control_mode = 'manual'
+            if direction == 'up':
+                manual_yaw_rpm = 0.0
+                manual_pitch_rpm = -MANUAL_SPEED
+            elif direction == 'down':
+                manual_yaw_rpm = 0.0
+                manual_pitch_rpm = MANUAL_SPEED
+            elif direction == 'left':
+                manual_yaw_rpm = -MANUAL_SPEED
+                manual_pitch_rpm = 0.0
+            elif direction == 'right':
+                manual_yaw_rpm = MANUAL_SPEED
+                manual_pitch_rpm = 0.0
+            else:
+                manual_yaw_rpm = 0.0
+                manual_pitch_rpm = 0.0
+
+    return jsonify({
+        'status': 'ok',
+        'mode': control_mode,
+        'yaw_rpm': manual_yaw_rpm,
+        'pitch_rpm': manual_pitch_rpm,
+    })
+
+
+@app.route('/set_mode', methods=['POST'])
+def set_mode():
+    """切换控制模式"""
+    global control_mode
+    data = request.get_json()
+    mode = data.get('mode', 'track')
+
+    with control_mode_lock:
+        if mode in ('track', 'idle'):
+            # 先停止测试线程
+            if test_thread and test_thread.is_alive():
+                test_stop.set()
+            control_mode = mode
+
+    # 同步 params 中的 control_enabled
+    with params_lock:
+        params['control_enabled'] = 1 if mode == 'track' else 0
+
+    return jsonify({'status': 'ok', 'mode': control_mode})
+
+
+@app.route('/test_signal', methods=['POST'])
+def test_signal():
+    """启动 / 停止测试信号"""
+    global test_thread, test_stop, control_mode
+    data = request.get_json()
+    signal = data.get('signal', 'stop')
+
+    if signal == 'stop':
+        test_stop.set()
+        if test_thread and test_thread.is_alive():
+            test_thread.join(timeout=2.0)
+            test_thread = None
+        with control_mode_lock:
+            control_mode = 'idle'
+    else:
+        # 先停止之前的线程
+        test_stop.set()
+        if test_thread and test_thread.is_alive():
+            test_thread.join(timeout=2.0)
+        test_stop.clear()
+        test_thread = threading.Thread(
+            target=_test_signal_runner,
+            args=(signal,),
+            daemon=True,
+        )
+        test_thread.start()
+
+    # 同步 params: 测试期间关闭 PID
+    with params_lock:
+        params['control_enabled'] = 0 if signal != 'stop' else params['control_enabled']
+
+    return jsonify({'status': 'ok', 'signal': signal, 'mode': control_mode})
+
+
+@app.route('/gimbal_reset', methods=['POST'])
+def gimbal_reset():
+    """复位云台 — 发送零速 + 切换到 idle 模式"""
+    global control_mode, manual_yaw_rpm, manual_pitch_rpm
+
+    with control_mode_lock:
+        control_mode = 'idle'
+    manual_yaw_rpm = 0.0
+    manual_pitch_rpm = 0.0
+
+    # 停止测试
+    test_stop.set()
+
+    # 同步 params
+    with params_lock:
+        params['control_enabled'] = 0
+
+    # 发送零速
+    with tracker_lock:
+        if gimbal_serial:
+            for _ in range(3):
+                gimbal_serial.send(CommandPacket(
+                    yaw_speed=0.0, pitch_speed=0.0,
+                    enabled=1, stability_enabled=1,
+                ))
+                time.sleep(0.02)
+
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/telemetry')
+def telemetry():
+    """获取串口遥测数据"""
+    with telemetry_lock:
+        return jsonify(dict(latest_telemetry))
 
 
 @app.route('/update_tracker', methods=['POST'])
@@ -717,6 +972,63 @@ HTML_PAGE = r'''
         padding:4px 8px; border-radius:4px; font-size:11px; width:120px;
     }
     .serial-row label { font-size:11px; color:#94a3b8; }
+
+    /* ── 控制面板 ── */
+    .control-panel {
+        background:#0f1019; border:1px solid #1e293b; border-radius:8px;
+        padding:14px; width:100%; max-width:950px; margin-top:10px;
+        box-shadow:0 4px 20px rgba(0,0,0,0.3);
+    }
+    .control-panel h3 { font-size:13px; color:#60a5fa; margin-bottom:10px; }
+    .control-row { display:flex; gap:16px; flex-wrap:wrap; }
+    .control-col { flex:1; min-width:130px; }
+    .control-col-title { font-size:10px; color:#64748b; margin-bottom:6px; letter-spacing:1px; }
+
+    /* 方向键十字布局 */
+    .dpad { display:grid; grid-template-columns:48px 48px 48px; grid-template-rows:48px 48px 48px; gap:3px; }
+    .dpad .corner { visibility:hidden; }
+    .btn-dir {
+        background:#1e3a5f; border:1px solid #2a4a7f; border-radius:6px;
+        color:#e2e8f0; font-size:18px; cursor:pointer;
+        display:flex; align-items:center; justify-content:center;
+        user-select:none; -webkit-user-select:none;
+        transition:background 0.1s;
+    }
+    .btn-dir:hover { background:#2a5a8f; }
+    .btn-dir:active, .btn-dir.active { background:#4ade80; color:#020617; }
+    .btn-dir.stop { background:#7f1d1d; color:#fca5a5; font-size:12px; font-weight:700; }
+    .btn-dir.stop:hover { background:#991b1b; }
+
+    /* 按钮样式 */
+    .btn-ctrl {
+        display:block; width:100%; padding:8px 10px; margin-bottom:5px;
+        border:none; border-radius:5px; font-size:11px; cursor:pointer; font-weight:600;
+        text-align:center; transition:background 0.15s;
+    }
+    .btn-track { background:#065f46; color:#4ade80; }
+    .btn-track:hover { background:#0a7a56; }
+    .btn-track.active { background:#4ade80; color:#020617; }
+    .btn-idle { background:#7f651d; color:#fbbf24; }
+    .btn-idle:hover { background:#9a7b2a; }
+    .btn-idle.active { background:#fbbf24; color:#020617; }
+    .btn-reset-ctrl { background:#7f1d1d; color:#fca5a5; }
+    .btn-reset-ctrl:hover { background:#991b1b; }
+    .btn-test { background:#1e3a5f; color:#60a5fa; }
+    .btn-test:hover { background:#2a5a8f; }
+    .btn-test.running { background:#4ade80; color:#020617; }
+    .btn-stop-test { background:#7f1d1d; color:#fca5a5; margin-top:10px; }
+    .btn-stop-test:hover { background:#991b1b; }
+
+    /* 遥测面板 */
+    .telemetry-box {
+        background:#020617; border:1px solid #1e293b; border-radius:6px;
+        padding:10px; margin-top:10px; font-family:'Courier New',monospace; font-size:11px;
+    }
+    .telemetry-box .t-title { color:#64748b; font-size:10px; margin-bottom:6px; }
+    .telemetry-box .t-row { display:flex; gap:16px; flex-wrap:wrap; color:#94a3b8; }
+    .telemetry-box .t-row .t-val { color:#4ade80; }
+    .telemetry-box .t-row .t-warn { color:#fbbf24; }
+    .telemetry-box .t-row .t-off { color:#ef4444; }
 </style>
 </head>
 <body>
@@ -763,6 +1075,59 @@ HTML_PAGE = r'''
             <div class="coord-cell"><div class="cl">TR</div><div class="cv">--</div></div>
             <div class="coord-cell"><div class="cl">BL</div><div class="cv">--</div></div>
             <div class="coord-cell"><div class="cl">BR</div><div class="cv">--</div></div>
+        </div>
+    </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<!--  云台控制面板                                                      -->
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<div class="control-panel">
+    <h3>🎮 云台控制</h3>
+    <div class="control-row">
+
+        <!-- 方向控制 -->
+        <div class="control-col">
+            <div class="control-col-title">方向控制 (按住移动，松开停止)</div>
+            <div class="dpad" id="dpad">
+                <div class="corner"></div>
+                <button class="btn-dir" id="btn-up"    data-dir="up">▲</button>
+                <div class="corner"></div>
+                <button class="btn-dir" id="btn-left"  data-dir="left">◀</button>
+                <button class="btn-dir stop" id="btn-stop-dpad" data-dir="stop">STOP</button>
+                <button class="btn-dir" id="btn-right" data-dir="right">▶</button>
+                <div class="corner"></div>
+                <button class="btn-dir" id="btn-down"  data-dir="down">▼</button>
+                <div class="corner"></div>
+            </div>
+        </div>
+
+        <!-- 模式切换 -->
+        <div class="control-col">
+            <div class="control-col-title">模式切换</div>
+            <button class="btn-ctrl btn-track active" id="btn-track" onclick="setMode('track')">🎯 开始跟踪</button>
+            <button class="btn-ctrl btn-idle" id="btn-idle" onclick="setMode('idle')">⏸ 待机</button>
+            <button class="btn-ctrl btn-reset-ctrl" id="btn-reset" onclick="resetGimbal()">🔄 复位云台</button>
+        </div>
+
+        <!-- 测试信号 -->
+        <div class="control-col">
+            <div class="control-col-title">测试信号</div>
+            <button class="btn-ctrl btn-test" id="btn-circle" onclick="startTest('circle')">⭕ 画圆</button>
+            <button class="btn-ctrl btn-test" id="btn-nod" onclick="startTest('nod')">↕ 点头</button>
+            <button class="btn-ctrl btn-stop-test" id="btn-stop-test" onclick="stopTest()">⏹ 停止测试</button>
+            <div class="control-col-title" style="margin-top:8px;">当前模式: <span id="mode_disp" style="color:#4ade80;">track</span></div>
+        </div>
+    </div>
+
+    <!-- 串口遥测 -->
+    <div class="telemetry-box">
+        <div class="t-title">📡 串口遥测 (STM32)</div>
+        <div class="t-row">
+            <span>IMU: Y=<span class="t-val" id="t_imu_yaw">--</span>° P=<span class="t-val" id="t_imu_pitch">--</span>° R=<span class="t-val" id="t_imu_roll">--</span>°</span>
+            <span>Motor: Y=<span class="t-val" id="t_motor_yaw">--</span>° P=<span class="t-val" id="t_motor_pitch">--</span>°</span>
+            <span>使能:<span class="t-val" id="t_enabled">--</span></span>
+            <span>增稳:<span class="t-val" id="t_stability">--</span></span>
         </div>
     </div>
 </div>
@@ -1073,8 +1438,124 @@ function updateData() {
         document.getElementById('err_y_px').textContent = d.err_y_px || '0';
     }).catch(e=>console.error(e));
 }
+
+// ── 遥测轮询 ──
+function updateTelemetry() {
+    fetch('/telemetry').then(r=>r.json()).then(d=>{
+        const toDeg = function(rad) { return (rad * 180 / Math.PI).toFixed(1); };
+        if (d.connected) {
+            document.getElementById('t_imu_yaw').textContent = toDeg(d.imu_yaw);
+            document.getElementById('t_imu_pitch').textContent = toDeg(d.imu_pitch);
+            document.getElementById('t_imu_roll').textContent = toDeg(d.imu_roll);
+            document.getElementById('t_motor_yaw').textContent = toDeg(d.yaw_motor_angle);
+            document.getElementById('t_motor_pitch').textContent = toDeg(d.pitch_motor_angle);
+            document.getElementById('t_enabled').textContent = d.enabled;
+            document.getElementById('t_enabled').className = d.enabled ? 't-val' : 't-off';
+            document.getElementById('t_stability').textContent = d.stability;
+            document.getElementById('t_stability').className = d.stability ? 't-val' : 't-warn';
+        }
+    }).catch(e=>{});
+}
+
+// ── 方向控制 ──
+(function() {
+    const dpadBtns = document.querySelectorAll('#dpad .btn-dir');
+    let activeDir = null;
+
+    function sendDir(dir) {
+        if (activeDir === dir) return;
+        activeDir = dir;
+        fetch('/manual_control', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({direction:dir})
+        }).catch(e=>console.error(e));
+
+        // 视觉反馈
+        dpadBtns.forEach(b => b.classList.remove('active'));
+        const btn = document.querySelector('[data-dir="'+dir+'"]');
+        if (btn) btn.classList.add('active');
+    }
+
+    dpadBtns.forEach(btn => {
+        const dir = btn.getAttribute('data-dir');
+        if (dir === 'stop') return;  // stop 按钮不同处理
+
+        btn.addEventListener('pointerdown', function(e) {
+            e.preventDefault();
+            sendDir(dir);
+        });
+        btn.addEventListener('pointerleave', function(e) {
+            sendDir('stop');
+        });
+        btn.addEventListener('pointerup', function(e) {
+            sendDir('stop');
+        });
+    });
+
+    // stop 按钮点击
+    document.getElementById('btn-stop-dpad').addEventListener('click', function() {
+        sendDir('stop');
+        dpadBtns.forEach(b => b.classList.remove('active'));
+    });
+})();
+
+// ── 模式切换 ──
+async function setMode(mode) {
+    const r = await fetch('/set_mode', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({mode:mode})
+    });
+    const d = await r.json();
+    document.getElementById('mode_disp').textContent = d.mode;
+    document.getElementById('btn-track').classList.toggle('active', d.mode === 'track');
+    document.getElementById('btn-idle').classList.toggle('active', d.mode === 'idle');
+    console.log('Mode:', d.mode);
+}
+
+// ── 测试信号 ──
+async function startTest(signal) {
+    const r = await fetch('/test_signal', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({signal:signal})
+    });
+    const d = await r.json();
+    document.getElementById('mode_disp').textContent = d.mode;
+    document.getElementById('btn-circle').classList.toggle('running', signal==='circle');
+    document.getElementById('btn-nod').classList.toggle('running', signal==='nod');
+    console.log('Test signal:', signal);
+}
+
+async function stopTest() {
+    const r = await fetch('/test_signal', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({signal:'stop'})
+    });
+    const d = await r.json();
+    document.getElementById('mode_disp').textContent = d.mode;
+    document.getElementById('btn-circle').classList.remove('running');
+    document.getElementById('btn-nod').classList.remove('running');
+    console.log('Test stopped');
+}
+
+// ── 复位 ──
+async function resetGimbal() {
+    await fetch('/gimbal_reset', {method:'POST'});
+    document.getElementById('mode_disp').textContent = 'idle';
+    document.getElementById('btn-track').classList.remove('active');
+    document.getElementById('btn-idle').classList.add('active');
+    document.getElementById('btn-circle').classList.remove('running');
+    document.getElementById('btn-nod').classList.remove('running');
+    console.log('Gimbal reset');
+}
+
 setInterval(updateData,200);
+setInterval(updateTelemetry,200);
 updateData();
+updateTelemetry();
 </script>
 </body>
 </html>
@@ -1090,13 +1571,13 @@ def parse_args():
     p.add_argument('--camera', type=int, default=0, help='摄像头索引（默认 0）')
     p.add_argument('--port', type=int, default=5000, help='Flask 端口（默认 5000）')
     p.add_argument('--no-flip', action='store_true', help='不翻转画面')
-    p.add_argument('--serial-port', type=str, default=None, help='串口端口号，例如 COM3')
+    p.add_argument('--serial-port', type=str, default="/dev/ttyS2", help='串口端口号（默认 Orange Pi 5 Max UART2: /dev/ttyS2）')
     p.add_argument('--serial-baud', type=int, default=1152000, help='串口波特率（默认 1152000）')
     return p.parse_args()
 
 
 def main():
-    global tracker, serial_stub
+    global tracker, gimbal_serial
 
     args = parse_args()
 
@@ -1108,15 +1589,32 @@ def main():
         tracker = GimbalTracker(_build_control_config(p))
 
     # ── 初始化串口 ──
-    serial_stub = GimbalSerialStub(port=args.serial_port, baudrate=args.serial_baud)
-    serial_stub.open()
+    if args.serial_port:
+        try:
+            gimbal_serial = GimbalSerial(port=args.serial_port, baudrate=args.serial_baud)
+            print(f"  串口已连接: {args.serial_port} @ {args.serial_baud}")
+        except Exception as e:
+            print(f"  ⚠ 串口打开失败: {e}")
+            gimbal_serial = None
+    else:
+        gimbal_serial = None
+
+    # ── 启动遥测读取线程 ──
+    telemetry_thread = threading.Thread(target=_telemetry_reader, daemon=True)
+    telemetry_thread.start()
 
     # ── 信号处理 ──
     def shutdown(_sig, _frame):
         print("\nShutting down...")
         stop_event.set()
-        if serial_stub:
-            serial_stub.close()
+        test_stop.set()
+        if gimbal_serial:
+            with tracker_lock:
+                try:
+                    gimbal_serial.send(CommandPacket(enabled=0))
+                    gimbal_serial.close()
+                except Exception:
+                    pass
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
@@ -1135,10 +1633,11 @@ def main():
     print("  QGimbal-Vision 启动成功")
     print(f"  摄像头:       {args.camera}")
     print(f"  串口:         {args.serial_port or '(未连接)'}")
-    print(f"  Web UI:       http://0.0.0.0:{args.port}")
+    print(f"  控制面板:     http://0.0.0.0:{args.port}")
     print(f"  主视频流:     http://0.0.0.0:{args.port}/video_feed")
     print(f"  调试视频流:   http://0.0.0.0:{args.port}/debug_feed")
     print(f"  数据接口:     http://0.0.0.0:{args.port}/data")
+    print(f"  遥测接口:     http://0.0.0.0:{args.port}/telemetry")
     print("=" * 60)
 
     app.run(host='0.0.0.0', port=args.port, threaded=True)

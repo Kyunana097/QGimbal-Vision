@@ -27,8 +27,8 @@ class GimbalSerialStub:
         - Floats are IEEE754 32-bit; STM32 is little-endian.
     """
 
-    port: Optional[str] = None
-    baudrate: int = 115200
+    port: Optional[str] = "/dev/ttyS2"   # Orange Pi 5 Max UART2
+    baudrate: int = 1_152_000           # 匹配 STM32 USART6 波特率
 
     # Enable fields: 0 disable, 1 enable, other no action
     laser_enabled: int = 2
