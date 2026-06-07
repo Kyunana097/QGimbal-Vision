@@ -27,9 +27,9 @@ class CommandPacket:
     """发送给 STM32 的控制指令"""
     yaw_speed: float = 0.0        # rpm, ±50
     pitch_speed: float = 0.0      # rpm, ±50
-    laser_enabled: int = 2        # 0关 1开 other不变
-    enabled: int = 2              # 0关 1开 other不变
-    stability_enabled: int = 2    # 0关 1开 other不变
+    laser_enabled: int = 2        # 0=关 1=开 其他=不变
+    enabled: int = 2              # 0=禁用 1=使能 其他=不变
+    stability_enabled: int = 2    # 0=关 1=开 其他=不变
 
     def pack(self) -> bytes:
         """打包为 12 字节二进制帧"""
@@ -66,8 +66,16 @@ class TelemetryPacket:
             return None
         if (sum(data[:31]) & 0xFF) != data[31]:
             return None
+        vals = struct.unpack("<7fBBBB", data)  # 11 个值: 7f + 4B
+        return cls(*vals[:10])                  # 前 10 个是字段, 第 11 个是校验和
+
+    @classmethod
+    def _raw_unpack(cls, data: bytes) -> Optional["TelemetryPacket"]:
+        """不校验直接解包 (帧同步退化模式)"""
+        if len(data) != TRANSMIT_PKG_SIZE:
+            return None
         vals = struct.unpack("<7fBBBB", data)
-        return cls(*vals)
+        return cls(*vals[:10])
 
 
 # ============================================================
@@ -79,8 +87,8 @@ class GimbalSerial:
 
     def __init__(
         self,
-        port: str = "/dev/ttyS2",      # Orange Pi 5 Max UART2
-        baudrate: int = 115200,        # STM32 USART6 波特率
+        port: str = "/dev/ttyS2",
+        baudrate: int = 115200,
         timeout: float = 0.05,
     ):
         import serial
@@ -91,16 +99,54 @@ class GimbalSerial:
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
             timeout=timeout,
+            write_timeout=0.5,
         )
+        self._cmd_pkg_size = RECEIVE_PKG_SIZE
+        self._tlm_pkg_size = TRANSMIT_PKG_SIZE
+        self._sync_offset = None  # 帧同步偏移
 
     def send(self, cmd: CommandPacket) -> None:
-        """发送控制指令"""
-        self.ser.write(cmd.pack())
+        """发送控制指令 — 原子写入 + flush 防止 STM32 空闲中断误触发"""
+        pkt = cmd.pack()
+        assert len(pkt) == self._cmd_pkg_size, \
+            f"命令包长度错误: {len(pkt)} != {self._cmd_pkg_size}"
+        self.ser.reset_output_buffer()
+        self.ser.write(pkt)
+        self.ser.flush()
+
+    def send_raw(self, data: bytes) -> None:
+        """发送原始二进制数据 (用于测试)"""
+        self.ser.reset_output_buffer()
+        self.ser.write(data)
+        self.ser.flush()
 
     def recv(self) -> Optional[TelemetryPacket]:
-        """非阻塞读取一帧遥测数据，无数据返回 None"""
-        if self.ser.in_waiting >= TRANSMIT_PKG_SIZE:
-            return TelemetryPacket.unpack(self.ser.read(TRANSMIT_PKG_SIZE))
+        """非阻塞读取一帧遥测数据
+
+        三级帧同步 (按优先级):
+          1. 校验和匹配 (搜索所有偏移)
+          2. 签名匹配: 状态字节 laser/ena/stab ∈ [0,2] (退化模式)
+        """
+        n = self.ser.in_waiting
+        if n < TRANSMIT_PKG_SIZE:
+            return None
+
+        buf = self.ser.read(n)
+
+        # 策略1: 全搜索 — 校验和验证
+        for off in range(len(buf) - TRANSMIT_PKG_SIZE + 1):
+            pkg = TelemetryPacket.unpack(buf[off:off + TRANSMIT_PKG_SIZE])
+            if pkg is not None:
+                return pkg
+
+        # 策略2: 签名匹配 — 状态字节应取值 0/1/2
+        for off in range(len(buf) - TRANSMIT_PKG_SIZE + 1):
+            b28, b29, b30 = buf[off + 28], buf[off + 29], buf[off + 30]
+            if 0 <= b28 <= 2 and 0 <= b29 <= 2 and 0 <= b30 <= 2:
+                pkg = TelemetryPacket._raw_unpack(buf[off:off + TRANSMIT_PKG_SIZE])
+                if pkg is not None:
+                    return pkg
+
         return None
 
     def drain(self) -> None:

@@ -92,5 +92,11 @@ class GimbalSerialStub:
 
         pkt = self.build_packet(yaw_rpm, pitch_rpm)
         write = getattr(ser, "write", None)
+        flush = getattr(ser, "flush", None)
+        reset_output = getattr(ser, "reset_output_buffer", None)
         if callable(write):
+            if callable(reset_output):
+                reset_output()       # 清空 TX 缓冲区
             write(pkt)
+            if callable(flush):
+                flush()              # 确保原子发送

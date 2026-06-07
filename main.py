@@ -55,7 +55,7 @@ DEFAULT_PARAMS = {
     'ratio_max': 2.00,         # 长宽比上限
 
     # ── 追踪控制 ──
-    'control_enabled': 1,      # 是否启用 PID 控制
+    'control_enabled': 0,      # 是否启用 PID 控制 (默认关, 网页开启才发)
     'deadband_px': 0.0,        # 像素死区
     'lost_timeout_s': 0.4,     # 丢目标超时 (s)
     'max_rpm_yaw': 20.0,       # Yaw 最大转速
@@ -108,7 +108,7 @@ gimbal_serial: GimbalSerial | None = None
 tracker_lock = threading.Lock()
 
 # 控制模式
-control_mode: str = 'track'        # 'track' | 'manual' | 'test' | 'idle'
+control_mode: str = 'idle'         # 'track' | 'manual' | 'test' | 'idle'  (默认待机不发信号)
 control_mode_lock = threading.Lock()
 
 # 手动控制当前速度
@@ -444,7 +444,7 @@ def capture_loop(camera_idx: int, flip_frame: bool = True):
                         gimbal_serial.send(CommandPacket(
                             yaw_speed=float(ctrl_out.yaw_rpm),
                             pitch_speed=float(ctrl_out.pitch_rpm),
-                            enabled=1, stability_enabled=1,
+                            # enabled=2, stab=2 避免每帧重置PID积分
                         ))
 
             elif mode == 'manual':
@@ -453,7 +453,6 @@ def capture_loop(camera_idx: int, flip_frame: bool = True):
                         gimbal_serial.send(CommandPacket(
                             yaw_speed=float(manual_yaw_rpm),
                             pitch_speed=float(manual_pitch_rpm),
-                            enabled=1, stability_enabled=1,
                         ))
             # 'test': 测试线程独立发送
             # 'idle': 不发送任何指令
@@ -532,25 +531,28 @@ def generate_debug_frames():
 def _telemetry_reader():
     """后台线程：持续读取 STM32 遥测数据"""
     while not stop_event.is_set():
-        with tracker_lock:
-            if gimbal_serial:
-                pkg = gimbal_serial.recv()
-                if pkg:
-                    with telemetry_lock:
-                        latest_telemetry.update({
-                            'connected': True,
-                            'imu_yaw': round(pkg.imu_yaw, 4),
-                            'imu_pitch': round(pkg.imu_pitch, 4),
-                            'imu_roll': round(pkg.imu_roll, 4),
-                            'yaw_imu_angle': round(pkg.yaw_imu_angle, 4),
-                            'pitch_imu_angle': round(pkg.pitch_imu_angle, 4),
-                            'yaw_motor_angle': round(pkg.yaw_motor_angle, 4),
-                            'pitch_motor_angle': round(pkg.pitch_motor_angle, 4),
-                            'enabled': pkg.enabled,
-                            'stability': pkg.stability_enabled,
-                            'laser': pkg.laser_enabled,
-                        })
-        time.sleep(0.01)
+        try:
+            with tracker_lock:
+                if gimbal_serial:
+                    pkg = gimbal_serial.recv()
+                    if pkg:
+                        with telemetry_lock:
+                            latest_telemetry.update({
+                                'connected': True,
+                                'imu_yaw': round(pkg.imu_yaw, 4),
+                                'imu_pitch': round(pkg.imu_pitch, 4),
+                                'imu_roll': round(pkg.imu_roll, 4),
+                                'yaw_imu_angle': round(pkg.yaw_imu_angle, 4),
+                                'pitch_imu_angle': round(pkg.pitch_imu_angle, 4),
+                                'yaw_motor_angle': round(pkg.yaw_motor_angle, 4),
+                                'pitch_motor_angle': round(pkg.pitch_motor_angle, 4),
+                                'enabled': pkg.enabled,
+                                'stability': pkg.stability_enabled,
+                                'laser': pkg.laser_enabled,
+                            })
+            time.sleep(0.01)
+        except Exception:
+            time.sleep(0.1)  # 出错时等久一点
 
 
 def _test_signal_runner(signal_type: str):
@@ -580,7 +582,7 @@ def _test_signal_runner(signal_type: str):
                     gimbal_serial.send(CommandPacket(
                         yaw_speed=float(yaw_rpm),
                         pitch_speed=float(pitch_rpm),
-                        enabled=1, stability_enabled=1,
+                        # 默认 enabled=2, stab=2 不重置PID
                     ))
             time.sleep(0.02)
     finally:
@@ -589,7 +591,7 @@ def _test_signal_runner(signal_type: str):
             if gimbal_serial:
                 gimbal_serial.send(CommandPacket(
                     yaw_speed=0.0, pitch_speed=0.0,
-                    enabled=1, stability_enabled=1,
+                    
                 ))
         with control_mode_lock:
             control_mode = 'idle'
@@ -711,6 +713,14 @@ def manual_control():
             manual_yaw_rpm = 0.0
             manual_pitch_rpm = 0.0
         elif control_mode != 'test':
+            if control_mode != 'manual':
+                # 进入手动模式: 关增稳→速度模式 (IMU不在pitch轴)
+                with tracker_lock:
+                    if gimbal_serial:
+                        gimbal_serial.send(CommandPacket(
+                            yaw_speed=0.0, pitch_speed=0.0,
+                            stability_enabled=0,
+                        ))
             control_mode = 'manual'
             if direction == 'up':
                 manual_yaw_rpm = 0.0
@@ -750,6 +760,23 @@ def set_mode():
                 test_stop.set()
             control_mode = mode
 
+    # 切换到 track: 使能+开增稳 (PID闭环, IMU反馈)
+    if mode == 'track':
+        with tracker_lock:
+            if gimbal_serial:
+                gimbal_serial.send(CommandPacket(
+                    yaw_speed=0.0, pitch_speed=0.0,
+                    enabled=1, stability_enabled=1,
+                ))
+    # 切换到 idle: 关闭增稳 (开环速度模式, 安全)
+    elif mode == 'idle':
+        with tracker_lock:
+            if gimbal_serial:
+                gimbal_serial.send(CommandPacket(
+                    yaw_speed=0.0, pitch_speed=0.0,
+                    stability_enabled=0,
+                ))
+
     # 同步 params 中的 control_enabled
     with params_lock:
         params['control_enabled'] = 1 if mode == 'track' else 0
@@ -772,6 +799,13 @@ def test_signal():
         with control_mode_lock:
             control_mode = 'idle'
     else:
+        # 关增稳→速度模式 (IMU不在pitch轴, PID闭环会振荡)
+        with tracker_lock:
+            if gimbal_serial:
+                gimbal_serial.send(CommandPacket(
+                    yaw_speed=0.0, pitch_speed=0.0,
+                    stability_enabled=0,
+                ))
         # 先停止之前的线程
         test_stop.set()
         if test_thread and test_thread.is_alive():
@@ -814,7 +848,7 @@ def gimbal_reset():
             for _ in range(3):
                 gimbal_serial.send(CommandPacket(
                     yaw_speed=0.0, pitch_speed=0.0,
-                    enabled=1, stability_enabled=1,
+                    
                 ))
                 time.sleep(0.02)
 
@@ -1593,6 +1627,14 @@ def main():
         try:
             gimbal_serial = GimbalSerial(port=args.serial_port, baudrate=args.serial_baud)
             print(f"  串口已连接: {args.serial_port} @ {args.serial_baud}")
+            # 上电立即发送安全指令: 速度归零, 禁用电机 (防毛刺误触发)
+            time.sleep(0.05)
+            gimbal_serial.send(CommandPacket(
+                yaw_speed=0.0, pitch_speed=0.0,
+                enabled=0, stability_enabled=0,
+            ))
+            gimbal_serial.drain()
+            print(f"  已发送安全指令 (disable + zero speed)")
         except Exception as e:
             print(f"  ⚠ 串口打开失败: {e}")
             gimbal_serial = None
