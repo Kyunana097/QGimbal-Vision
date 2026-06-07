@@ -4,7 +4,37 @@
       "Bash(ls -la \"C:/Users/62705/Desktop/【开源】全新重制二维云台/QGimbal-Vision/\")",
       "Read(//c/Users/62705/Desktop/【开源】全新重制二维云台/QGimbal-Vision/**)",
       "Bash(cat /sys/kernel/debug/gpio 2>/dev/null | head -50 || echo \"debugfs not available\")",
-      "Read(//sys/kernel/debug/**)"
+      "Read(//sys/kernel/debug/**)",
+      "Bash(ls -la /dev/ttyS* /dev/ttyAMA* /dev/ttyUSB* 2>/dev/null || echo \"No standard serial devices found\")",
+      "Read(//dev/**)",
+      "Bash(ls -la /dev/tty* 2>/dev/null | head -30)",
+      "Bash(cat /proc/device-tree/model 2>/dev/null; echo \"---\"; uname -m; echo \"---\"; groups)",
+      "Read(//sys/firmware/devicetree/base/**)",
+      "Bash(dmesg)",
+      "Read(//boot/**)",
+      "Read(//boot/dtb/rockchip/**)",
+      "Read(//boot/dtb/rockchip/overlay/**)",
+      "Read(//boot/extlinux/**)",
+      "Read(//etc/**)",
+      "Bash(sudo sed -i 's/^overlay_prefix=rk3588$/overlay_prefix=rk3588\\\\noverlays=uart2-m0/' /boot/orangepiEnv.txt)",
+      "Bash(sudo -n cat /boot/orangepiEnv.txt)",
+      "Bash(pkexec tee -a /boot/orangepiEnv.txt)",
+      "Bash(chmod +x /home/orangepi/QGimbal-Vision/tools/circle_test.py)",
+      "Bash(pip install *)",
+      "Bash(python3 -c \"import serial; print\\('pyserial version:', serial.__version__\\)\")",
+      "Bash(timeout 3 python3 -c ' *)",
+      "Bash(python3 -c \"import py_compile; py_compile.compile\\('/home/orangepi/QGimbal-Vision/main.py', doraise=True\\)\")",
+      "Bash(git add *)",
+      "Bash(git commit -m 'feat: 新增云台网页控制面板，修复UART2通信配置 *)",
+      "Bash(git config *)",
+      "Bash(chmod +x /home/orangepi/QGimbal-Vision/tools/serial_hello_test.py)",
+      "Bash(python3 -c \"import py_compile; py_compile.compile\\('/home/orangepi/QGimbal-Vision/tools/serial_hello_test.py', doraise=True\\)\")",
+      "Bash(fuser /dev/ttyS2)",
+      "Bash(stty -F /dev/ttyS2)",
+      "Bash(git commit -m 'fix: 波特率改为115200，改用UART3后改回UART2，新增串口测试工具 *)"
+    ],
+    "additionalDirectories": [
+      "/boot"
     ]
   }
 }
