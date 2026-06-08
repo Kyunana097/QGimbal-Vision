@@ -106,17 +106,15 @@ class GimbalSerial:
         self._sync_offset = None  # 帧同步偏移
 
     def send(self, cmd: CommandPacket) -> None:
-        """发送控制指令 — 原子写入 + flush 防止 STM32 空闲中断误触发"""
+        """发送控制指令 — write + flush 确保完整帧发送"""
         pkt = cmd.pack()
         assert len(pkt) == self._cmd_pkg_size, \
             f"命令包长度错误: {len(pkt)} != {self._cmd_pkg_size}"
-        self.ser.reset_output_buffer()
         self.ser.write(pkt)
-        self.ser.flush()
+        self.ser.flush()  # 等待硬件 FIFO 发送完成, 保证帧边界
 
     def send_raw(self, data: bytes) -> None:
         """发送原始二进制数据 (用于测试)"""
-        self.ser.reset_output_buffer()
         self.ser.write(data)
         self.ser.flush()
 

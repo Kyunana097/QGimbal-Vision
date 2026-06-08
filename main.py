@@ -15,7 +15,9 @@ QGimbal-Vision — 二维云台视觉追踪 + Flask 实时调参
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import os
 import signal
 import sys
 import threading
@@ -44,7 +46,7 @@ DEFAULT_PARAMS = {
 
     # ── 矩形检测（开源算法参数） ──
     'min_area_ratio': 0.005,   # 最小面积比例（相对图像）
-    'max_area_ratio': 0.5,     # 最大面积比例（相对图像）
+    'max_area_ratio': 0.15,    # 最大面积比例, 0.15=约46000px 过滤天花板灯
     'approx_eps': 0.02,        # 多边形逼近 epsilon
     'angle_tol': 25.0,         # 直角容差（度）
 
@@ -56,6 +58,8 @@ DEFAULT_PARAMS = {
 
     # ── 追踪控制 ──
     'control_enabled': 0,      # 是否启用 PID 控制 (默认关, 网页开启才发)
+    'center_offset_x': 0.0,    # 中心偏移 X (px, 正=右移, 激光在摄像头右边时用正值)
+    'center_offset_y': 0.0,    # 中心偏移 Y (px, 正=下移, 激光在摄像头下方时用正值)
     'deadband_px': 0.0,        # 像素死区
     'lost_timeout_s': 0.4,     # 丢目标超时 (s)
     'max_rpm_yaw': 20.0,       # Yaw 最大转速
@@ -82,7 +86,10 @@ DEFAULT_PARAMS = {
 INT_PARAMS = {
     'blur_ksize', 'canny_low', 'canny_high', 'close_ksize', 'close_iter',
     'min_edge', 'control_enabled', 'use_clahe', 'invert_yaw', 'invert_pitch',
+    'center_offset_x', 'center_offset_y',
 }
+
+SAVED_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config_saved.json')
 
 # ══════════════════════════════════════════════════════════════════
 # 全局状态
@@ -432,6 +439,13 @@ def capture_loop(camera_idx: int, flip_frame: bool = True):
                 mode = control_mode
 
             if tracker is not None and mode == 'track':
+                # 动态使能
+                tracker.cfg.enabled = True
+                # 应用中心偏移 (激光与摄像头不共线补偿)
+                if target_center is not None:
+                    offset_cx = target_center[0] - p.get('center_offset_x', 0)
+                    offset_cy = target_center[1] - p.get('center_offset_y', 0)
+                    target_center = (offset_cx, offset_cy)
                 ret, ctrl_out = tracker.update(
                     frame_w=frame.shape[1],
                     frame_h=frame.shape[0],
@@ -444,7 +458,6 @@ def capture_loop(camera_idx: int, flip_frame: bool = True):
                         gimbal_serial.send(CommandPacket(
                             yaw_speed=float(ctrl_out.yaw_rpm),
                             pitch_speed=float(ctrl_out.pitch_rpm),
-                            # enabled=2, stab=2 避免每帧重置PID积分
                         ))
 
             elif mode == 'manual':
@@ -659,6 +672,41 @@ def get_params():
         return jsonify(dict(params))
 
 
+@app.route('/save_params', methods=['POST'])
+def save_params():
+    """保存当前参数到 JSON 文件"""
+    with params_lock:
+        try:
+            with open(SAVED_CONFIG, 'w') as f:
+                json.dump(dict(params), f, indent=2)
+            return jsonify({'status': 'ok', 'path': SAVED_CONFIG})
+        except Exception as e:
+            return jsonify({'status': 'error', 'message': str(e)})
+
+
+@app.route('/load_params', methods=['POST'])
+def load_params():
+    """从 JSON 文件加载参数"""
+    global tracker
+    try:
+        with open(SAVED_CONFIG, 'r') as f:
+            saved = json.load(f)
+    except Exception:
+        return jsonify({'status': 'error', 'message': '没有已保存的配置文件'})
+
+    with params_lock:
+        for k, v in saved.items():
+            if k in params:
+                params[k] = v
+
+    # 重建 PID 控制器
+    with tracker_lock:
+        cfg = _build_control_config(params)
+        tracker = GimbalTracker(cfg)
+
+    return jsonify({'status': 'ok', 'params': dict(params)})
+
+
 @app.route('/reset_params', methods=['POST'])
 def reset_params():
     global tracker
@@ -714,12 +762,12 @@ def manual_control():
             manual_pitch_rpm = 0.0
         elif control_mode != 'test':
             if control_mode != 'manual':
-                # 进入手动模式: 关增稳→速度模式 (IMU不在pitch轴)
+                # 进入手动模式: 使能+关增稳→开环速度模式
                 with tracker_lock:
                     if gimbal_serial:
                         gimbal_serial.send(CommandPacket(
                             yaw_speed=0.0, pitch_speed=0.0,
-                            stability_enabled=0,
+                            enabled=1, stability_enabled=0,
                         ))
             control_mode = 'manual'
             if direction == 'up':
@@ -760,22 +808,24 @@ def set_mode():
                 test_stop.set()
             control_mode = mode
 
-    # 切换到 track: 使能+开增稳 (PID闭环, IMU反馈)
+    # 切换到 track: 使能但不增稳 (纯视觉伺服, IMU在yaw轴不适用pitch)
     if mode == 'track':
         with tracker_lock:
             if gimbal_serial:
                 gimbal_serial.send(CommandPacket(
                     yaw_speed=0.0, pitch_speed=0.0,
-                    enabled=1, stability_enabled=1,
+                    enabled=1, stability_enabled=0,
                 ))
-    # 切换到 idle: 关闭增稳 (开环速度模式, 安全)
+    # 切换到 idle: 归零+禁用电机 (多发几次确保收到)
     elif mode == 'idle':
         with tracker_lock:
             if gimbal_serial:
-                gimbal_serial.send(CommandPacket(
-                    yaw_speed=0.0, pitch_speed=0.0,
-                    stability_enabled=0,
-                ))
+                for _ in range(5):
+                    gimbal_serial.send(CommandPacket(
+                        yaw_speed=0.0, pitch_speed=0.0,
+                        enabled=0,
+                    ))
+                    time.sleep(0.01)
 
     # 同步 params 中的 control_enabled
     with params_lock:
@@ -799,12 +849,12 @@ def test_signal():
         with control_mode_lock:
             control_mode = 'idle'
     else:
-        # 关增稳→速度模式 (IMU不在pitch轴, PID闭环会振荡)
+        # 使能+关增稳→开环速度模式 (IMU不在pitch轴, PID闭环会振荡)
         with tracker_lock:
             if gimbal_serial:
                 gimbal_serial.send(CommandPacket(
                     yaw_speed=0.0, pitch_speed=0.0,
-                    stability_enabled=0,
+                    enabled=1, stability_enabled=0,
                 ))
         # 先停止之前的线程
         test_stop.set()
@@ -842,13 +892,12 @@ def gimbal_reset():
     with params_lock:
         params['control_enabled'] = 0
 
-    # 发送零速
+    # 发送零速+禁用 (多发确保收到)
     with tracker_lock:
         if gimbal_serial:
-            for _ in range(3):
+            for _ in range(5):
                 gimbal_serial.send(CommandPacket(
-                    yaw_speed=0.0, pitch_speed=0.0,
-                    
+                    yaw_speed=0.0, pitch_speed=0.0, enabled=0,
                 ))
                 time.sleep(0.02)
 
@@ -1318,9 +1367,19 @@ HTML_PAGE = r'''
     <div class="section-title">追踪控制参数</div>
     <div class="slider-grid">
         <div class="slider-group">
-            <label>启用控制 <span class="val" id="v_control_enabled">1</span></label>
-            <input type="range" id="control_enabled" min="0" max="1" step="1" value="1"
+            <label>启用控制 <span class="val" id="v_control_enabled">0</span></label>
+            <input type="range" id="control_enabled" min="0" max="1" step="1" value="0"
                    oninput="setP('control_enabled',this.value)">
+        </div>
+        <div class="slider-group">
+            <label>中心偏移 X <span class="val" id="v_center_offset_x">0.0</span> px</label>
+            <input type="range" id="center_offset_x" min="-150" max="150" step="1" value="0"
+                   oninput="setP('center_offset_x',this.value)">
+        </div>
+        <div class="slider-group">
+            <label>中心偏移 Y <span class="val" id="v_center_offset_y">0.0</span> px</label>
+            <input type="range" id="center_offset_y" min="-150" max="150" step="1" value="0"
+                   oninput="setP('center_offset_y',this.value)">
         </div>
         <div class="slider-group">
             <label>像素死区 <span class="val" id="v_deadband_px">0.0</span></label>
@@ -1367,6 +1426,8 @@ HTML_PAGE = r'''
     <div class="btn-row">
         <button class="btn btn-apply" onclick="applyPID()">应用 PID / 控制参数</button>
         <button class="btn btn-reset" onclick="resetAll()">重置所有为默认值</button>
+        <button class="btn btn-serial" onclick="saveParams()" style="background:#065f46;color:#4ade80;">💾 保存参数</button>
+        <button class="btn btn-serial" onclick="loadParams()" style="background:#1e3a5f;color:#60a5fa;">📂 加载参数</button>
     </div>
 </div>
 
@@ -1418,6 +1479,24 @@ function reconnectSerial() {
     }).then(r=>r.json()).then(d=>console.log('Serial:', d)).catch(e=>console.error(e));
 }
 
+async function saveParams() {
+    const r = await fetch('/save_params', {method:'POST'});
+    const d = await r.json();
+    if (d.status === 'ok') alert('参数已保存到 ' + d.path);
+    else alert('保存失败: ' + d.message);
+}
+async function loadParams() {
+    const r = await fetch('/load_params', {method:'POST'});
+    const d = await r.json();
+    if (d.status === 'ok') {
+        // 更新所有滑块和显示值
+        for (const [k,v] of Object.entries(d.params)) {
+            const el = document.getElementById(k);
+            if (el) { el.value = v; document.getElementById('v_'+k).textContent = fmt(k, v); }
+        }
+        alert('参数已加载!');
+    } else alert('加载失败: ' + d.message);
+}
 function resetAll() {
     fetch('/reset_params', {method:'POST'})
         .then(r=>r.json())
@@ -1614,6 +1693,19 @@ def main():
     global tracker, gimbal_serial
 
     args = parse_args()
+
+    # ── 加载已保存参数 (如果存在) ──
+    if os.path.exists(SAVED_CONFIG):
+        try:
+            with open(SAVED_CONFIG, 'r') as f:
+                saved = json.load(f)
+            with params_lock:
+                for k, v in saved.items():
+                    if k in params:
+                        params[k] = v
+            print(f"  已加载保存的参数: {SAVED_CONFIG}")
+        except Exception as e:
+            print(f"  ⚠ 加载参数失败: {e}")
 
     # ── 初始化 PID 追踪器 ──
     with params_lock:
