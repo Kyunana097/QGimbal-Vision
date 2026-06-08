@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Tuple
 
 from .config import ControlConfig, PIDConfig
@@ -23,18 +24,31 @@ class ControlOutput:
 
 
 class GimbalTracker:
-    """Convert image target center to gimbal yaw/pitch RPM commands."""
+    """Convert image target center to gimbal yaw/pitch RPM commands.
+
+    Built-in protections:
+      - Center jump filter: ignores detections > jump_limit_px from last position
+      - Exponential decay: when target lost, RPM decays smoothly to zero
+    """
 
     def __init__(self, cfg: ControlConfig) -> None:
         self.cfg = cfg
         self._yaw_pid = _pid_from_cfg(cfg.yaw_pid)
         self._pitch_pid = _pid_from_cfg(cfg.pitch_pid)
         self._last_seen_ts = 0.0
+        self._prev_center: Tuple[float, float] | None = None
+        self._last_yaw_rpm: float = 0.0
+        self._last_pitch_rpm: float = 0.0
+        self._lost_since: float | None = None  # timestamp when target was lost
 
     def reset(self) -> None:
         self._yaw_pid.reset()
         self._pitch_pid.reset()
         self._last_seen_ts = 0.0
+        self._prev_center = None
+        self._last_yaw_rpm = 0.0
+        self._last_pitch_rpm = 0.0
+        self._lost_since = None
 
     def update(
         self,
@@ -56,17 +70,45 @@ class GimbalTracker:
             now = time.time()
 
         if not self.cfg.enabled:
-            return False,ControlOutput(0.0, 0.0, 0.0, 0.0)
+            return False, ControlOutput(0.0, 0.0, 0.0, 0.0)
 
-        # Lost target handling
+        # ── 保护1: 中心点跳变过滤 ──
+        if target_center is not None and self._prev_center is not None:
+            dx = target_center[0] - self._prev_center[0]
+            dy = target_center[1] - self._prev_center[1]
+            dist = math.hypot(dx, dy)
+            if dist > self.cfg.jump_limit_px:
+                # 跳变过大, 视为误识别, 当作丢目标处理
+                target_center = None
+
+        # ── 目标丢失处理 ──
         if target_center is None:
-            if self._last_seen_ts > 0 and (now - self._last_seen_ts) <= self.cfg.lost_timeout_s:
-                # within grace period: keep trying with zero error (hold still).
-                return False,ControlOutput(0.0, 0.0, 0.0, 0.0)
-            self.reset()
-            return True,ControlOutput(0.0, 0.0, 0.0, 0.0)
+            if self._last_seen_ts > 0 and (
+                now - self._last_seen_ts
+            ) <= self.cfg.lost_timeout_s:
+                # 宽限期内: 保持上一帧输出
+                return False, ControlOutput(
+                    self._last_yaw_rpm, self._last_pitch_rpm, 0.0, 0.0
+                )
 
+            # ── 保护2: 指数衰减 RPM → 0 ──
+            if self._lost_since is None:
+                self._lost_since = now
+            elapsed_lost = now - self._lost_since
+            decay = math.exp(-elapsed_lost / self.cfg.decay_tau_s)
+            # 衰减到小于 0.1 rpm 时彻底清零
+            if abs(self._last_yaw_rpm) * decay < 0.1:
+                self.reset()
+                return True, ControlOutput(0.0, 0.0, 0.0, 0.0)
+
+            yaw_rpm = self._last_yaw_rpm * decay
+            pitch_rpm = self._last_pitch_rpm * decay
+            return True, ControlOutput(yaw_rpm, pitch_rpm, 0.0, 0.0)
+
+        # ── 目标有效 ──
         self._last_seen_ts = now
+        self._lost_since = None
+        self._prev_center = target_center
 
         cx, cy = target_center
         center_x = frame_w * 0.5
@@ -75,7 +117,6 @@ class GimbalTracker:
         err_x_px = _apply_deadband(cx - center_x, self.cfg.deadband_px)
         err_y_px = _apply_deadband(cy - center_y, self.cfg.deadband_px)
 
-        # Normalize error to [-1, 1] w.r.t. half image size.
         half_w = max(1.0, center_x)
         half_h = max(1.0, center_y)
         err_x = err_x_px / half_w
@@ -92,7 +133,10 @@ class GimbalTracker:
         if self.cfg.invert_pitch:
             pitch_rpm = -pitch_rpm
 
-        return True,ControlOutput(yaw_rpm, pitch_rpm, err_x_px, err_y_px)
+        self._last_yaw_rpm = yaw_rpm
+        self._last_pitch_rpm = pitch_rpm
+
+        return True, ControlOutput(yaw_rpm, pitch_rpm, err_x_px, err_y_px)
 
 
 def _pid_from_cfg(cfg: PIDConfig) -> PID:
@@ -103,4 +147,3 @@ def _pid_from_cfg(cfg: PIDConfig) -> PID:
         integral_limit=cfg.integral_limit,
         output_limit=cfg.output_limit,
     )
-

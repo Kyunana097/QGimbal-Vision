@@ -35,6 +35,12 @@ class ControlConfig:
     deadband_px: float = 6.0
     lost_timeout_s: float = 0.25
 
+    # Center jump filter: 中心点位移超过此值视为误识别, 忽略 (px)
+    jump_limit_px: float = 200.0
+
+    # Exponential decay: 丢目标后RPM衰减时间常数 (秒, 越大衰减越慢)
+    decay_tau_s: float = 0.5
+
     # Map PID output (normalized) -> RPM
     max_rpm_yaw: float = 120.0
     max_rpm_pitch: float = 120.0

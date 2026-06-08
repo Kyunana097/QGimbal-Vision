@@ -61,7 +61,9 @@ DEFAULT_PARAMS = {
     'center_offset_x': 0.0,    # 中心偏移 X (px, 正=右移, 激光在摄像头右边时用正值)
     'center_offset_y': 0.0,    # 中心偏移 Y (px, 正=下移, 激光在摄像头下方时用正值)
     'deadband_px': 0.0,        # 像素死区
-    'lost_timeout_s': 0.4,     # 丢目标超时 (s)
+    'lost_timeout_s': 0.2,     # 丢目标超时 (s)
+    'jump_limit_px': 200.0,    # 中心点跳变阈值 (px), 超过视为误识别
+    'decay_tau_s': 0.5,        # 丢目标后 RPM 衰减时间常数 (s)
     'max_rpm_yaw': 20.0,       # Yaw 最大转速
     'max_rpm_pitch': 20.0,     # Pitch 最大转速
     'invert_yaw': 1,           # 反转 Yaw 方向
@@ -105,6 +107,7 @@ frame_event = threading.Event()
 stop_event = threading.Event()
 
 latest_data = {}
+latest_pid = {'yaw_rpm': 0, 'pitch_rpm': 0, 'err_x_px': 0, 'err_y_px': 0}
 data_lock = threading.Lock()
 
 A4_RATIO = np.sqrt(2)
@@ -453,6 +456,11 @@ def capture_loop(camera_idx: int, flip_frame: bool = True):
                     dt=max(dt, 1e-6),
                     now=now,
                 )
+                # 每秒打印一次 PID 输出
+                if int(now) != int(getattr(tracker, '_last_log', 0)):
+                    tracker._last_log = int(now)
+                    print(f"[TRACK] yaw={ctrl_out.yaw_rpm:+6.2f} pitch={ctrl_out.pitch_rpm:+6.2f} "
+                          f"err=({ctrl_out.err_x_px:+5.0f},{ctrl_out.err_y_px:+5.0f})")
                 if ret and gimbal_serial:
                     with tracker_lock:
                         gimbal_serial.send(CommandPacket(
@@ -492,19 +500,13 @@ def capture_loop(camera_idx: int, flip_frame: bool = True):
 
             # ── 更新数据面板 ──
             with data_lock:
-                d = dict(latest_data)
+                # PID 输出单独存, 避免被 process_frame 覆写
                 if ctrl_out is not None:
-                    d['yaw_rpm'] = round(ctrl_out.yaw_rpm, 2)
-                    d['pitch_rpm'] = round(ctrl_out.pitch_rpm, 2)
-                    d['err_x_px'] = round(ctrl_out.err_x_px, 1)
-                    d['err_y_px'] = round(ctrl_out.err_y_px, 1)
-                else:
-                    d['yaw_rpm'] = 0
-                    d['pitch_rpm'] = 0
-                    d['err_x_px'] = 0
-                    d['err_y_px'] = 0
-                d['fps'] = round(fps, 1)
-                latest_data = d
+                    latest_pid['yaw_rpm'] = round(ctrl_out.yaw_rpm, 2)
+                    latest_pid['pitch_rpm'] = round(ctrl_out.pitch_rpm, 2)
+                    latest_pid['err_x_px'] = round(ctrl_out.err_x_px, 1)
+                    latest_pid['err_y_px'] = round(ctrl_out.err_y_px, 1)
+                latest_data['fps'] = round(fps, 1)
 
             time.sleep(0.005)
 
@@ -637,12 +639,16 @@ def debug_feed():
 @app.route('/data')
 def data():
     with data_lock:
-        return jsonify(dict(latest_data))
+        d = dict(latest_data)
+        d.update(latest_pid)
+    with control_mode_lock:
+        d['control_mode'] = control_mode
+    return jsonify(d)
 
 
 @app.route('/set_param', methods=['POST'])
 def set_param():
-    global control_mode
+    global control_mode, tracker
     data = request.get_json()
     name = data['name']
     value = data['value']
@@ -662,6 +668,34 @@ def set_param():
                         control_mode = 'track'
                     elif value == 0:
                         control_mode = 'idle'
+
+    # PID/控制参数变更时自动重建 tracker, 使调参即时生效
+    pid_keys = {'yaw_kp','yaw_ki','yaw_kd','yaw_integral_limit','yaw_output_limit',
+                'pitch_kp','pitch_ki','pitch_kd','pitch_integral_limit','pitch_output_limit',
+                'max_rpm_yaw','max_rpm_pitch','invert_yaw','invert_pitch',
+                'deadband_px','lost_timeout_s','jump_limit_px','decay_tau_s'}
+    if name in pid_keys:
+        with tracker_lock:
+            cfg = _build_control_config(params)
+            if tracker is not None:
+                # 保留积分等运行时状态, 只更换配置
+                tracker.cfg = cfg
+                tracker._yaw_pid.kp = cfg.yaw_pid.kp
+                tracker._yaw_pid.ki = cfg.yaw_pid.ki
+                tracker._yaw_pid.kd = cfg.yaw_pid.kd
+                tracker._yaw_pid.integral_limit = cfg.yaw_pid.integral_limit
+                tracker._yaw_pid.output_limit = cfg.yaw_pid.output_limit
+                tracker._pitch_pid.kp = cfg.pitch_pid.kp
+                tracker._pitch_pid.ki = cfg.pitch_pid.ki
+                tracker._pitch_pid.kd = cfg.pitch_pid.kd
+                tracker._pitch_pid.integral_limit = cfg.pitch_pid.integral_limit
+                tracker._pitch_pid.output_limit = cfg.pitch_pid.output_limit
+                tracker.cfg.max_rpm_yaw = cfg.max_rpm_yaw
+                tracker.cfg.max_rpm_pitch = cfg.max_rpm_pitch
+                tracker.cfg.invert_yaw = cfg.invert_yaw
+                tracker.cfg.invert_pitch = cfg.invert_pitch
+                tracker.cfg.deadband_px = cfg.deadband_px
+                tracker.cfg.lost_timeout_s = cfg.lost_timeout_s
 
     return jsonify({'status': 'ok'})
 
@@ -930,6 +964,8 @@ def _build_control_config(p: dict) -> ControlConfig:
         enabled=bool(p['control_enabled']),
         deadband_px=float(p['deadband_px']),
         lost_timeout_s=float(p['lost_timeout_s']),
+        jump_limit_px=float(p.get('jump_limit_px', 200)),
+        decay_tau_s=float(p.get('decay_tau_s', 0.5)),
         max_rpm_yaw=float(p['max_rpm_yaw']),
         max_rpm_pitch=float(p['max_rpm_pitch']),
         invert_yaw=bool(p['invert_yaw']),
@@ -1146,7 +1182,7 @@ HTML_PAGE = r'''
         <div class="data-row"><span class="label">上 / 下 (px)</span><span class="value" id="edges_h">--</span></div>
         <div class="data-row"><span class="label">左 / 右 (px)</span><span class="value" id="edges_v">--</span></div>
 
-        <div class="data-section">PID 控制输出</div>
+        <div class="data-section">PID 控制输出 <span id="mode_tag" style="font-size:10px;color:#fbbf24;">(idle)</span></div>
         <div class="data-row"><span class="label">Yaw RPM</span><span class="value hl" id="yaw_rpm">--</span></div>
         <div class="data-row"><span class="label">Pitch RPM</span><span class="value hl" id="pitch_rpm">--</span></div>
         <div class="data-row"><span class="label">Err X (px)</span><span class="value" id="err_x_px">--</span></div>
@@ -1382,6 +1418,16 @@ HTML_PAGE = r'''
                    oninput="setP('center_offset_y',this.value)">
         </div>
         <div class="slider-group">
+            <label>跳变阈值 <span class="val" id="v_jump_limit_px">200.0</span> px</label>
+            <input type="range" id="jump_limit_px" min="50" max="500" step="10" value="200"
+                   oninput="setP('jump_limit_px',this.value)">
+        </div>
+        <div class="slider-group">
+            <label>衰减时间 <span class="val" id="v_decay_tau_s">0.500</span> s</label>
+            <input type="range" id="decay_tau_s" min="0.1" max="2.0" step="0.1" value="0.5"
+                   oninput="setP('decay_tau_s',this.value)">
+        </div>
+        <div class="slider-group">
             <label>像素死区 <span class="val" id="v_deadband_px">0.0</span></label>
             <input type="range" id="deadband_px" min="0" max="100" step="1" value="0"
                    oninput="setP('deadband_px',this.value)">
@@ -1443,6 +1489,7 @@ HTML_PAGE = r'''
 const FLOAT_KEYS = new Set([
     'approx_eps','angle_tol','persp_min','ratio_min','ratio_max',
     'min_area_ratio','max_area_ratio','deadband_px','lost_timeout_s',
+    'jump_limit_px','decay_tau_s',
     'yaw_kp','yaw_ki','yaw_kd','yaw_integral_limit','yaw_output_limit',
     'pitch_kp','pitch_ki','pitch_kd','pitch_integral_limit','pitch_output_limit',
     'max_rpm_yaw','max_rpm_pitch'
@@ -1549,6 +1596,10 @@ function updateData() {
         document.getElementById('pitch_rpm').textContent = d.pitch_rpm || '0';
         document.getElementById('err_x_px').textContent = d.err_x_px || '0';
         document.getElementById('err_y_px').textContent = d.err_y_px || '0';
+        // 显示当前模式
+        var mode = d.control_mode || 'idle';
+        document.getElementById('mode_tag').textContent = '(' + mode + ')';
+        document.getElementById('mode_tag').style.color = mode === 'track' ? '#4ade80' : '#fbbf24';
     }).catch(e=>console.error(e));
 }
 
